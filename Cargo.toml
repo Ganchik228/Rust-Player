@@ -1,0 +1,11 @@
+[package]
+name = "PrakRust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+egui = "0.32.3"
+eframe = "0.32.3"
+rodio = "0.17"
+rfd = "0.14"
+symphonia = { version = "0.5", features = ["all"] }
