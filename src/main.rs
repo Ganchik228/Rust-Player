@@ -1,10 +1,16 @@
 use eframe::egui;
 use egui::{Color32, RichText};
-use rodio::{Decoder, OutputStream, Sink};
+use kira::{
+    manager::{AudioManager, AudioManagerSettings},
+    sound::streaming::{StreamingSoundData, StreamingSoundHandle, StreamingSoundSettings},
+    sound::FromFileError,
+    tween::Tween,
+    StartTime,
+};
 use rfd::FileDialog;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufReader, copy};
+use std::io::copy;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use symphonia::core::formats::FormatOptions;
@@ -170,8 +176,8 @@ pub enum PlaybackState {
 }
 
 pub struct AudioPlayer {
-    sink: Option<Sink>,
-    _stream: Option<OutputStream>,
+    audio_manager: AudioManager,
+    current_sound_handle: Option<StreamingSoundHandle<FromFileError>>,
     state: PlaybackState,
     current_track: Option<Track>,
     playlists: HashMap<String, Playlist>,
@@ -185,6 +191,10 @@ pub struct AudioPlayer {
     show_add_track_dialog: bool,
     new_playlist_name: String,
     music_folder: PathBuf,
+    seek_slider_position: f32,  // Для слайдера перемотки
+    is_seeking: bool,           // Флаг активного seeking
+    seek_step: u64,             // Шаг перемотки в секундах
+    animation_time: f32,        // Время для анимации
 }
 
 impl AudioPlayer {
@@ -195,14 +205,17 @@ impl AudioPlayer {
             fs::create_dir(&music_folder)?;
         }
 
+        // Создаем аудио менеджер Kira
+        let audio_manager = AudioManager::new(AudioManagerSettings::default())?;
+
         // Создаем плейлист по умолчанию
         let mut playlists = HashMap::new();
         let default_playlist = Playlist::new("Default".to_string(), &music_folder)?;
         playlists.insert("Default".to_string(), default_playlist);
 
         Ok(AudioPlayer {
-            sink: None,
-            _stream: None,
+            audio_manager,
+            current_sound_handle: None,
             state: PlaybackState::Stopped,
             current_track: None,
             playlists,
@@ -216,6 +229,10 @@ impl AudioPlayer {
             show_add_track_dialog: false,
             new_playlist_name: String::new(),
             music_folder,
+            seek_slider_position: 0.0,
+            is_seeking: false,
+            seek_step: 10,  // По умолчанию 10 секунд
+            animation_time: 0.0,
         })
     }
 
@@ -356,8 +373,8 @@ impl AudioPlayer {
     pub fn play(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         match self.state {
             PlaybackState::Paused => {
-                if let Some(ref sink) = self.sink {
-                    sink.play();
+                if let Some(ref mut handle) = self.current_sound_handle {
+                    handle.resume(Tween::default());
                 }
                 self.state = PlaybackState::Playing;
                 self.last_update = Instant::now();
@@ -374,19 +391,18 @@ impl AudioPlayer {
 
     pub fn pause(&mut self) {
         if self.state == PlaybackState::Playing {
-            if let Some(ref sink) = self.sink {
-                sink.pause();
+            if let Some(ref mut handle) = self.current_sound_handle {
+                let _ = handle.pause(Tween::default());
             }
             self.state = PlaybackState::Paused;
         }
     }
 
     pub fn stop(&mut self) {
-        if let Some(ref sink) = self.sink {
-            sink.stop();
+        if let Some(ref mut handle) = self.current_sound_handle {
+            let _ = handle.stop(Tween::default());
         }
-        self.sink = None;
-        self._stream = None;
+        self.current_sound_handle = None;
         self.state = PlaybackState::Stopped;
         self.position = Duration::from_secs(0);
     }
@@ -425,24 +441,82 @@ impl AudioPlayer {
 
     pub fn set_volume(&mut self, volume: f32) {
         self.volume = volume.clamp(0.0, 1.0);
-        if let Some(ref sink) = self.sink {
-            sink.set_volume(self.volume);
+        if let Some(ref mut handle) = self.current_sound_handle {
+            let _ = handle.set_volume(self.volume as f64, Tween::default());
         }
     }
 
     pub fn seek_to(&mut self, position: Duration) -> Result<(), Box<dyn std::error::Error>> {
-        // Rodio не поддерживает прямую перемотку, поэтому перезагружаем трек
-        if let Some(track) = self.current_track.clone() {
-            self.load_and_play_track(track)?;
-            self.position = position;
-            // В реальном приложении здесь была бы более сложная логика перемотки
+        // Проверяем, что позиция в пределах трека
+        if let Some(ref track) = self.current_track {
+            let max_duration = track.duration.unwrap_or(Duration::from_secs(300));
+            let clamped_position = if position > max_duration {
+                max_duration
+            } else {
+                position
+            };
+            
+            println!("Attempting to seek to: {:.2}s (clamped from {:.2}s)", 
+                clamped_position.as_secs_f32(), position.as_secs_f32());
+            
+            if let Some(ref mut handle) = self.current_sound_handle {
+                // Проверяем состояние handle перед seeking
+                match handle.state() {
+                    kira::sound::PlaybackState::Playing | 
+                    kira::sound::PlaybackState::Paused => {
+                        // Kira поддерживает seeking для потокового воспроизведения
+                        handle.seek_to(clamped_position.as_secs_f64());
+                        self.position = clamped_position;
+                        self.last_update = Instant::now();
+                        println!("Seek successful to {:.2}s!", clamped_position.as_secs_f32());
+                    },
+                    _ => {
+                        println!("Cannot seek - track is stopped");
+                        self.position = clamped_position;
+                    }
+                }
+            } else {
+                // Если трек не воспроизводится, просто запоминаем позицию
+                self.position = clamped_position;
+                println!("No handle available - storing position for later");
+            }
+        } else {
+            println!("No current track to seek in");
         }
         Ok(())
     }
 
     pub fn get_position(&self) -> Duration {
+        if let Some(ref handle) = self.current_sound_handle {
+            // Проверяем состояние handle перед получением позиции
+            match handle.state() {
+                kira::sound::PlaybackState::Playing | 
+                kira::sound::PlaybackState::Paused => {
+                    // Получаем текущую позицию от Kira
+                    let position = handle.position();
+                    let duration = Duration::from_secs_f64(position);
+                    
+                    // Ограничиваем позицию длительностью трека
+                    if let Some(ref track) = self.current_track {
+                        let max_duration = track.duration.unwrap_or(Duration::from_secs(300));
+                        if duration > max_duration {
+                            return max_duration;
+                        }
+                    }
+                    
+                    return duration;
+                },
+                _ => {
+                    // Если трек остановлен, возвращаем сохраненную позицию
+                    return self.position;
+                }
+            }
+        }
+        // Если нет handle, возвращаем сохраненную позицию
         self.position
     }
+
+
 
     fn get_current_track(&self) -> Option<Track> {
         if let Some(playlist_name) = &self.current_playlist {
@@ -464,47 +538,94 @@ impl AudioPlayer {
     fn load_and_play_track(&mut self, track: Track) -> Result<(), Box<dyn std::error::Error>> {
         self.stop();
         
-        let file = File::open(&track.path)?;
-        let reader = BufReader::new(file);
-        let source = Decoder::new(reader)?;
+        // Используем потоковое воспроизведение для избежания зависания
+        let sound_data = StreamingSoundData::from_file(&track.path)?;
         
-        // Создаем новый поток и sink для rodio 0.17
-        let (_stream, stream_handle) = OutputStream::try_default()?;
-        let sink = Sink::try_new(&stream_handle)?;
+        // Создаем настройки воспроизведения
+        let settings = StreamingSoundSettings::new()
+            .volume(self.volume as f64)
+            .start_time(StartTime::Immediate);
         
-        sink.append(source);
-        sink.set_volume(self.volume);
-        sink.play();
+        // Воспроизводим звук
+        let mut handle = self.audio_manager.play(sound_data.with_settings(settings))?;
         
-        self.sink = Some(sink);
-        self._stream = Some(_stream);
+        // Устанавливаем начальную позицию, если нужно
+        let seek_position = self.position;
+        if seek_position > Duration::from_secs(0) {
+            // Ограничиваем позицию длительностью трека
+            let max_duration = track.duration.unwrap_or(Duration::from_secs(300));
+            let clamped_position = if seek_position > max_duration {
+                max_duration
+            } else {
+                seek_position
+            };
+            
+            println!("Setting initial position to: {:.2}s", clamped_position.as_secs_f32());
+            handle.seek_to(clamped_position.as_secs_f64());
+            self.position = clamped_position;
+        } else {
+            self.position = Duration::from_secs(0);
+        }
+        
+        self.current_sound_handle = Some(handle);
         self.current_track = Some(track);
         self.state = PlaybackState::Playing;
-        self.position = Duration::from_secs(0);
         self.last_update = Instant::now();
         
+        println!("Track loaded and started playing");
         Ok(())
     }
 
     pub fn update(&mut self) {
+        // Обновляем время анимации
+        let now = Instant::now();
+        let delta_time = now.duration_since(self.last_update).as_secs_f32();
+        self.animation_time += delta_time;
+        
         if self.state == PlaybackState::Playing {
-            let now = Instant::now();
-            let elapsed = now.duration_since(self.last_update);
-            self.position += elapsed;
-            self.last_update = now;
-
-            // Check if current track finished
-            if let Some(ref sink) = self.sink {
-                if sink.empty() {
-                    if let Some(playlist) = self.get_current_playlist() {
-                        if !playlist.tracks.is_empty() {
-                            // Track finished, play next
-                            let _ = self.next();
-                        }
-                    }
+            // Обновляем позицию из Kira только если есть активный handle
+            if let Some(ref handle) = self.current_sound_handle {
+                // Безопасно получаем позицию
+                let position = handle.position();
+                let old_position = self.position;
+                self.position = Duration::from_secs_f64(position);
+                
+                // Отладка каждые 2 секунды
+                if (self.position.as_secs() % 2 == 0) && (old_position.as_secs() != self.position.as_secs()) {
+                    println!("Position update: {:.2}s -> {:.2}s", old_position.as_secs_f32(), self.position.as_secs_f32());
                 }
+                
+                // Проверяем состояние воспроизведения
+                let playback_state = handle.state();
+                match playback_state {
+                    kira::sound::PlaybackState::Stopped => {
+                        // Трек закончился, переходим к следующему
+                        println!("Track stopped, moving to next");
+                        self.state = PlaybackState::Stopped;
+                        if let Some(playlist) = self.get_current_playlist() {
+                            if !playlist.tracks.is_empty() {
+                                let _ = self.next();
+                                return;
+                            }
+                        }
+                    },
+                    kira::sound::PlaybackState::Paused => {
+                        if self.state != PlaybackState::Paused {
+                            println!("Track paused");
+                            self.state = PlaybackState::Paused;
+                        }
+                    },
+                    kira::sound::PlaybackState::Playing => {
+                        // Все в порядке, продолжаем
+                    },
+                    _ => {}
+                }
+            } else {
+                println!("No sound handle available during update");
             }
         }
+        
+        self.last_update = now;
     }
 }
 
@@ -538,10 +659,43 @@ impl eframe::App for AudioPlayerApp {
                 ui.horizontal(|ui| {
                     ui.label("Playing:");
                     ui.label(RichText::new(&track.title).color(Color32::LIGHT_BLUE));
+                    
+                    // Красивый анимированный индикатор воспроизведения
+                    if self.player.state == PlaybackState::Playing {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(60.0, 20.0), egui::Sense::hover());
+                            
+                            // Рисуем волновую анимацию
+                            let painter = ui.painter();
+                            let time = self.player.animation_time;
+                            let center_y = rect.center().y;
+                            
+                            for i in 0..5 {
+                                let x = rect.left() + (i as f32 * 12.0) + 6.0;
+                                let wave_offset = (time * 3.0 + i as f32 * 0.5).sin();
+                                let height = 3.0 + wave_offset * 7.0;
+                                
+                                let color = Color32::from_rgb(100 + (wave_offset * 50.0) as u8, 150, 255);
+                                
+                                painter.rect_filled(
+                                    egui::Rect::from_center_size(
+                                        egui::Pos2::new(x, center_y),
+                                        egui::Vec2::new(3.0, height.abs())
+                                    ),
+                                    2.0,
+                                    color
+                                );
+                            }
+                        });
+                    } else if self.player.state == PlaybackState::Paused {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new("⏸").color(Color32::YELLOW));
+                        });
+                    }
                 });
                 
                 // Progress bar with time display and seeking
-                let current_time = self.player.position;
+                let current_time = self.player.get_position();
                 let track_duration = track.duration.unwrap_or(Duration::from_secs(180));
                 
                 ui.horizontal(|ui| {
@@ -552,25 +706,35 @@ impl eframe::App for AudioPlayerApp {
                         current_secs % 60
                     ));
                     
-                    // Используем реальную длительность трека из метаданных
-                    let progress = current_time.as_secs_f32() / track_duration.as_secs_f32();
+                    // Обновляем позицию слайдера только если не происходит перемотка
+                    if !self.player.is_seeking {
+                        self.player.seek_slider_position = current_time.as_secs_f32() / track_duration.as_secs_f32();
+                    }
                     
-                    let progress_bar = egui::ProgressBar::new(progress.clamp(0.0, 1.0))
-                        .desired_width(200.0)
-                        .animate(self.player.state == PlaybackState::Playing);
+                    // Интерактивный слайдер для перемотки
+                    let slider_response = ui.add(
+                        egui::Slider::new(&mut self.player.seek_slider_position, 0.0..=1.0)
+                            .show_value(false)
+                            .custom_formatter(|_n, _range| String::new())
+                    );
                     
-                    let response = ui.add(progress_bar);
+                    // Обработка перемотки через слайдер
+                    if slider_response.changed() {
+                        self.player.is_seeking = true;
+                        let seek_time = Duration::from_secs_f32(
+                            self.player.seek_slider_position * track_duration.as_secs_f32()
+                        );
+                        let _ = self.player.seek_to(seek_time);
+                    }
                     
-                    // Добавляем возможность перемотки по клику
-                    if response.clicked() {
-                        if let Some(click_pos) = response.interact_pointer_pos() {
-                            let rect = response.rect;
-                            let relative_x = (click_pos.x - rect.left()) / rect.width();
-                            let seek_time = Duration::from_secs_f32(
-                                relative_x * track_duration.as_secs_f32()
-                            );
-                            let _ = self.player.seek_to(seek_time);
-                        }
+                    // Сбрасываем флаг seeking когда перестаем перетаскивать
+                    if !slider_response.dragged() {
+                        self.player.is_seeking = false;
+                    }
+                    
+                    // Показываем подсказку
+                    if slider_response.hovered() {
+                        slider_response.on_hover_text("Перетащите для перемотки трека");
                     }
                     
                     let duration_secs = track_duration.as_secs();
@@ -591,11 +755,14 @@ impl eframe::App for AudioPlayerApp {
                     let _ = self.player.previous();
                 }
                 
-                // Перемотка назад на 10 секунд
-                if ui.button("⏪").clicked() {
+                // Перемотка назад
+                if ui.button(&format!("⏪{}", self.player.seek_step))
+                    .on_hover_text(&format!("Перемотать назад на {} секунд", self.player.seek_step))
+                    .clicked() {
                     let current_pos = self.player.get_position();
-                    let new_pos = if current_pos >= Duration::from_secs(10) {
-                        current_pos - Duration::from_secs(10)
+                    let seek_duration = Duration::from_secs(self.player.seek_step);
+                    let new_pos = if current_pos >= seek_duration {
+                        current_pos - seek_duration
                     } else {
                         Duration::from_secs(0)
                     };
@@ -615,10 +782,13 @@ impl eframe::App for AudioPlayerApp {
                     }
                 }
                 
-                // Перемотка вперед на 10 секунд
-                if ui.button("⏩").clicked() {
+                // Перемотка вперед
+                if ui.button(&format!("⏩{}", self.player.seek_step))
+                    .on_hover_text(&format!("Перемотать вперед на {} секунд", self.player.seek_step))
+                    .clicked() {
                     let current_pos = self.player.get_position();
-                    let new_pos = current_pos + Duration::from_secs(10);
+                    let seek_duration = Duration::from_secs(self.player.seek_step);
+                    let new_pos = current_pos + seek_duration;
                     let _ = self.player.seek_to(new_pos);
                 }
                 
@@ -633,11 +803,21 @@ impl eframe::App for AudioPlayerApp {
 
             ui.separator();
 
-            // Volume control
+            // Volume control and seek step
             ui.horizontal(|ui| {
                 ui.label("Volume:");
                 ui.add(egui::Slider::new(&mut self.player.volume, 0.0..=1.0).step_by(0.01));
                 self.player.set_volume(self.player.volume);
+                
+                ui.separator();
+                
+                ui.label("Seek Step:");
+                let mut seek_step_f32 = self.player.seek_step as f32;
+                if ui.add(egui::Slider::new(&mut seek_step_f32, 1.0..=60.0)
+                    .suffix("s")
+                    .step_by(1.0)).changed() {
+                    self.player.seek_step = seek_step_f32 as u64;
+                }
             });
 
             ui.separator();
